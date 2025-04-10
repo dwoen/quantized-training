@@ -8,7 +8,7 @@ from torch.fx import GraphModule
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
 
-from .mapping import graph_copy
+from .mapping import replace_node_with_graph_module
 from ..pt2e_utils import get_aten_graph_module
 from ..quantize_pt2e import create_getattr_from_value
 from ..quantizer.xnnpack_quantizer_utils import _convert_scalars_to_attrs
@@ -202,7 +202,7 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
 
     from torch.fx.node import map_arg
     from torch._export import capture_pre_autograd_graph
-    from .mapping import graph_copy
+    from .mapping import replace_node_with_graph_module
 
     # Helper: are shapes identical except at 'axis'?
     def all_same_except_dim(list_of_shapes, axis):
@@ -261,7 +261,7 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
             logger.info(f"Skipping cat node {node} that only differs on dim={dim}")
             continue
 
-        # Otherwise, proceed with your "stack rewriting"
+        # Otherwise proceed with "stack rewriting"
         logger.info(f"Node {node} has truly mismatched shapes. Converting to 'stack' approach.")
 
         # Convert node.args to Python values
@@ -285,7 +285,7 @@ def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
                 return output.reshape(*shape_prefix, *output.shape[1:])
 
         gm = capture_pre_autograd_graph(Concat(), (*args[0],))
-        graph_copy(model, gm, node)
+        replace_node_with_graph_module(model, gm, node)
 
     model.graph.lint()
 
@@ -347,7 +347,7 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
             Expand(), (input_node.meta["val"],)
         )
 
-        graph_copy(model, gm, node)
+        replace_node_with_graph_module(model, gm, node)
         model.graph.erase_node(node)
 
     model.graph.lint()
@@ -535,7 +535,7 @@ def replace_quantize_mx_with_reduce(model: torch.fx.GraphModule):
                 return scale, quantized
 
         gm = capture_pre_autograd_graph(QuantizeMXDecomposed(), (node.args[0].meta["val"],))
-        graph_copy(model, gm, node)
+        replace_node_with_graph_module(model, gm, node)
 
     graph.lint()
     graph.eliminate_dead_code()
