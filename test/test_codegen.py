@@ -628,8 +628,7 @@ if __name__ == "__main__":
         orig_output, new_output = transform(
             gm,
             example_args,
-            # output_file="yolov11",
-            # output_dir=args.output_dir,
+            patterns=vector_stages
         )
     else:
         raise ValueError(f"Model {args.model} not supported")
