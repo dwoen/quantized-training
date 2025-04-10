@@ -1,6 +1,8 @@
 import argparse
 import logging
 from typing import List
+import os
+import sys
 
 import torch
 from datasets import load_dataset
@@ -34,6 +36,12 @@ from quantized_training.codegen.utils import (
     replace_interpolate,
     replace_rmsnorm_with_layer_norm,
 )
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+target_path = os.path.join(script_dir, '../examples/language_modeling')
+sys.path.append(os.path.abspath(target_path))
+
+from prepare_model import set_qscheme
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +92,11 @@ if __name__ == "__main__":
         "--use_mixed_qscheme",
         action="store_true",
         help="Quantize attention matrix multiplication using per-tensor symmetric quantization"
+    )
+    parser.add_argument(
+        "--qscheme",
+        default=None,
+        help="Quantization scheme to use for LLMs."
     )
     add_qspec_args(parser)
     args = parser.parse_args()
@@ -446,7 +459,9 @@ if __name__ == "__main__":
                 logits = self.lm_head(hidden_states)
                 return logits
 
-        gm = prepare_pt2e(LlamaWrapper(), quantizer, example_args)
+        set_qscheme(quantizer, args.qscheme)
+
+        gm = prepare_pt2e(LlamaWrapper(), quantizer, example_args, example_kwargs)
 
         hidden_size = model.model.layers[0].input_layernorm.weight.shape[-1]
         example_input = torch.randn(1, 128, hidden_size, dtype=torch.bfloat16)
