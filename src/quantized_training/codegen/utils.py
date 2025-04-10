@@ -8,7 +8,7 @@ from torch.fx import GraphModule
 from torch.fx.passes.utils.matcher_utils import InternalMatch, SubgraphMatcher
 from torch.fx.passes.utils.source_matcher_utils import get_source_partitions
 
-from .mapping import replace_node_with_graph_module
+from .mapping import graph_copy
 from ..pt2e_utils import get_aten_graph_module
 from ..quantize_pt2e import create_getattr_from_value
 from ..quantizer.xnnpack_quantizer_utils import _convert_scalars_to_attrs
@@ -19,6 +19,7 @@ __all__ = [
     "convert_cat_and_stack_as_stack_on_dim0",
     "convert_cat_with_mismatched_shapes_to_stack",
     "convert_expand_to_memory_copy",
+    "eliminate_dtype_conversion",
     "get_conv_bn_layers",
     "pad_matmul_inputs_for_unroll_alignment",
     "pad_vit_embeddings_output",
@@ -41,47 +42,6 @@ def get_conv_bn_layers(model):
                 if isinstance(model._modules[module_names[k-1]], torch.nn.Conv2d):
                     layers.append([module_names[k-1], name])
     return layers
-
-
-def fuse(model: torch.fx.GraphModule) -> torch.nn.Module:
-    """
-    Fuses convolution/BN and linear/BN layers for inference purposes.
-    """
-    from torch.nn.utils import fuse_conv_bn_weights
-
-    for node in list(model.graph.nodes):
-        if (
-            node.target == torch.ops.aten._native_batch_norm_legit.default and
-            node.args[0].target == torch.ops.aten.conv2d.default and
-            len(node.args[0].users) == 1 and
-            node.args[5] == False  # inference mode
-        ):
-            conv_node = node.args[0]
-
-            conv_w = model.get_parameter(conv_node.args[1])
-            conv_b = model.get_parameter(conv_node.args[2])
-
-            bn_w = model.get_parameter(node.args[1])
-            bn_b = model.get_parameter(node.args[2])
-            bn_rm = model.get_buffer(node.args[3])
-            bn_rv = model.get_buffer(node.args[4])
-            bn_eps = node.args[7]
-
-            fused_conv_w, fused_conv_b = fuse_conv_bn_weights(
-                conv_w, conv_b, bn_rm, bn_rv, bn_eps, bn_w, bn_b
-            )
-
-            model.register_parameter(conv_node.args[1].target, fused_conv_w)
-            model.register_parameter(conv_node.args[2].target, fused_conv_b)
-
-            node.replace_all_uses_with(conv_node)
-            model.graph.erase_node(node)
-
-    model.graph.lint()
-    model.graph.eliminate_dead_code()
-    model.recompile()
-
-    return model
 
 
 def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
@@ -175,45 +135,157 @@ def convert_cat_and_stack_as_stack_on_dim0(model: GraphModule):
     return model
 
 
+# def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
+#     """
+#     Convert `torch.cat` operations where input tensors have different shapes by replacing them
+#     with a `torch.stack` operation along the concatenated dimensions.
+
+#     Args:
+#         model (GraphModule): The PyTorch FX GraphModule to be modified.
+
+#     Returns:
+#         GraphModule: The transformed GraphModule with `torch.cat` operations adjusted to `torch.stack`.
+#     """
+#     partitions = get_source_partitions(model.graph, [torch.cat])
+#     partitions = list(itertools.chain.from_iterable(partitions.values()))
+#     for partition in partitions:
+#         node = partition.output_nodes[0]
+#         if node.target != torch.ops.aten.cat.default:
+#             continue
+
+#         input_shape = list(node.args[0][0].shape)
+#         if all(list(n.shape) == input_shape for n in node.args[0][1:]):
+#             continue
+
+#         logger.info(f"Node {node} has different input shapes")
+#         dim = node.args[1]
+
+#         args = torch.fx.node.map_arg(node.args, lambda n: n.value)
+#         shape = list(args[0][0].shape[:dim])
+
+#         class Concat(torch.nn.Module):
+#             def forward(self, *inputs):
+#                 result = []
+#                 for idx in itertools.product(*[range(dim) for dim in shape]):
+#                     tensor = torch.cat([x[idx] for x in inputs], dim=0)
+#                     result.append(tensor)
+#                 output = torch.stack(result, dim=0)
+#                 return output.reshape(*shape, *output.shape[1:])
+
+#         gm = capture_pre_autograd_graph(Concat(), (*args[0],))
+#         graph_copy(model, gm, node)
+
+#     model.graph.lint()
+
+#     model.graph.eliminate_dead_code()
+#     model.recompile()
+#     return model
+
 def convert_cat_with_mismatched_shapes_to_stack(model: GraphModule):
     """
-    Convert `torch.cat` operations where input tensors have different shapes by replacing them
-    with a `torch.stack` operation along the concatenated dimensions.
+    Convert `torch.cat` operations where input tensors truly differ in shapes
+    (beyond just the cat dimension) by replacing them with a `torch.stack`.
+
+    - If the dimension is not explicitly provided, we default to 0
+      (this prevents IndexError if node.args[1] is missing).
+    - If shapes differ only in the requested cat dimension, we skip rewriting
+      (common for YOLO multi-scale cat ops that differ only by channel).
+    - Otherwise, we rewrite to a 'stack' approach.
 
     Args:
         model (GraphModule): The PyTorch FX GraphModule to be modified.
 
     Returns:
-        GraphModule: The transformed GraphModule with `torch.cat` operations adjusted to `torch.stack`.
+        GraphModule: The transformed GraphModule with some `torch.cat` ops
+        replaced by `torch.stack` if they're truly mismatched.
     """
+
+    from torch.fx.node import map_arg
+    from torch._export import capture_pre_autograd_graph
+    from .mapping import graph_copy
+
+    # Helper: are shapes identical except at 'axis'?
+    def all_same_except_dim(list_of_shapes, axis):
+        # Axis could be negative, so handle that
+        # but for simplicity let's let each shape
+        # be the same rank, or bail out.
+        if not list_of_shapes:
+            return True
+        base = list_of_shapes[0]
+        rank = len(base)
+        if axis < 0:
+            axis += rank
+
+        for shape in list_of_shapes[1:]:
+            if len(shape) != rank:
+                return False
+            for i, (bd, sd) in enumerate(zip(base, shape)):
+                if i == axis:
+                    continue
+                if bd != sd:
+                    return False
+        return True
+
     partitions = get_source_partitions(model.graph, [torch.cat])
     partitions = list(itertools.chain.from_iterable(partitions.values()))
+
     for partition in partitions:
         node = partition.output_nodes[0]
         if node.target != torch.ops.aten.cat.default:
             continue
 
-        input_shape = list(node.args[0][0].shape)
-        if all(list(n.shape) == input_shape for n in node.args[0][1:]):
+        cat_inputs = node.args[0]
+        if not cat_inputs:
+            # no inputs at all? skip
             continue
 
-        logger.info(f"Node {node} has different input shapes")
-        dim = node.args[1]
+        # Safely handle dimension
+        if len(node.args) < 2:
+            # no 'dim' => default is 0
+            dim = 0
+        else:
+            dim = node.args[1]
+            # If 'dim' is also a fx.Node, try to read the int from its .meta or default to 0
+            if isinstance(dim, torch.fx.Node):
+                dim = dim.meta.get('val', 0)
 
-        args = torch.fx.node.map_arg(node.args, lambda n: n.value)
-        shape = list(args[0][0].shape[:dim])
+        # If all shapes are actually the same, skip
+        first_shape = list(cat_inputs[0].shape)
+        if all(list(inp.shape) == first_shape for inp in cat_inputs[1:]):
+            continue
+
+        shapes_list = [list(inp.shape) for inp in cat_inputs]
+
+        # If shapes differ only along dim => skip rewriting (YOLO often does this)
+        if all_same_except_dim(shapes_list, dim):
+            logger.info(f"Skipping cat node {node} that only differs on dim={dim}")
+            continue
+
+        # Otherwise, proceed with your "stack rewriting"
+        logger.info(f"Node {node} has truly mismatched shapes. Converting to 'stack' approach.")
+
+        # Convert node.args to Python values
+        # so we can read them in a small capture module
+        args = map_arg(node.args, lambda n: n.value)
+        # Ensure dim is an int if it wasn't
+        if not isinstance(dim, int):
+            dim = 0
+
+        shape_prefix = list(args[0][0].shape[:dim])
 
         class Concat(torch.nn.Module):
             def forward(self, *inputs):
                 result = []
-                for idx in itertools.product(*[range(dim) for dim in shape]):
+                # We'll do a nested iteration up to 'dim' dims
+                for idx in itertools.product(*[range(d) for d in shape_prefix]):
+                    # gather slices from each input
                     tensor = torch.cat([x[idx] for x in inputs], dim=0)
                     result.append(tensor)
                 output = torch.stack(result, dim=0)
-                return output.reshape(*shape, *output.shape[1:])
+                return output.reshape(*shape_prefix, *output.shape[1:])
 
         gm = capture_pre_autograd_graph(Concat(), (*args[0],))
-        replace_node_with_graph_module(model, gm, node)
+        graph_copy(model, gm, node)
 
     model.graph.lint()
 
@@ -275,7 +347,7 @@ def convert_expand_to_memory_copy(model: torch.fx.GraphModule):
             Expand(), (input_node.meta["val"],)
         )
 
-        replace_node_with_graph_module(model, gm, node)
+        graph_copy(model, gm, node)
         model.graph.erase_node(node)
 
     model.graph.lint()
@@ -463,10 +535,28 @@ def replace_quantize_mx_with_reduce(model: torch.fx.GraphModule):
                 return scale, quantized
 
         gm = capture_pre_autograd_graph(QuantizeMXDecomposed(), (node.args[0].meta["val"],))
-        replace_node_with_graph_module(model, gm, node)
+        graph_copy(model, gm, node)
 
     graph.lint()
     graph.eliminate_dead_code()
+    model.recompile()
+    return model
+
+
+def eliminate_dtype_conversion(model: torch.fx.GraphModule):
+    for node in list(model.graph.nodes):
+        # Eliminate dtype conversion nodes.
+        if node.target == torch.ops.aten.to.dtype:
+            node.replace_all_uses_with(node.args[0])
+            model.graph.erase_node(node)
+            continue
+
+        # Remove the dtype argument from softmax nodes.
+        if node.target == torch.ops.aten.softmax.int and len(node.args) > 2:
+            node.args = node.args[:-1]
+
+    model.graph.lint()
+    model.graph.eliminate_dead_code()
     model.recompile()
     return model
 

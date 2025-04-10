@@ -1,5 +1,5 @@
-import logging
 import operator
+import logging
 import os
 import struct
 
@@ -7,7 +7,7 @@ import torch
 from torch.fx import Node
 from torch.fx.operator_schemas import normalize_function
 
-from .param_pb2 import Argument, Memory, OpOverload, Tensor
+from .param_pb2 import Argument, IntList, Memory, OpOverload, Tensor
 from ..pt2e_utils import dtype_byte_size
 
 logger = logging.getLogger(__name__)
@@ -53,17 +53,24 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
         f"Expected node {node} has value attribute."
     )
 
-    reshape_node = node.meta.get("reshape")
-    is_reshape_fused_with_last_op = node.op == "call_module" and not is_output
-
-    if reshape_node is not None and not is_reshape_fused_with_last_op:
+    # If a reshape operation is fused at the output of an operation, it should
+    # not be applied again when consuming the node, which has op call_module.
+    reshape_node = node.meta.get("reshape", None)
+    if reshape_node is not None and (is_output or node.op != "call_module"):
         field.reshape.CopyFrom(map_node(reshape_node))
-        field.reshape.kwargs["output_shape"].int_list.values.extend(node.shape)
+        # There could be additional operations (view, reshape, and etc.) after
+        # the permute/transpose operation. Store the output shape of the last
+        # reshape operation for convenience.
+        field.reshape.kwargs["output_shape"].CopyFrom(Argument(
+            int_list=IntList(values=node.shape)
+        ))
         if not is_output:
             node = reshape_node.args[0]
-    elif (getitem_node := node.meta.get("slicing")) is not None:
+    elif (getitem_node := node.meta.get("slicing", None)) is not None:
         field.reshape.CopyFrom(map_node(getitem_node))
-        field.reshape.kwargs["output_shape"].int_list.values.extend(node.shape)
+        field.reshape.kwargs["output_shape"].CopyFrom(Argument(
+            int_list=IntList(values=node.shape)
+        ))
         node = getitem_node.args[0]
 
     if (dq_scale := node.meta.get("dq_scale", None)) is not None:
@@ -74,7 +81,10 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
         node = source_node
 
     field.node = node.name
-    field.shape.extend(list(node.shape) or [1])
+    if len(node.shape) > 0:
+        field.shape.extend(list(node.shape))
+    else:
+        field.shape.append(1)
 
     if (dtype := node.meta.get("dtype", None)) is not None:
         field.dtype = dtype
@@ -85,7 +95,7 @@ def set_tensor_field(field, node, output_dir=None, is_output=False):
         field.memory.partition = memory.partition_id
         field.memory.address = memory.start
 
-    if output_dir is not None:
+    if output_dir is not None and is_output:
         save_tensor(node.value, os.path.join(output_dir, f"{node.name}.bin"))
 
 
@@ -116,7 +126,7 @@ def set_output_field(param, node, output_dir):
         logger.warning(f"Unsupported output type: {type(node.value)}")
 
 
-def convert_arg(value) -> Argument:
+def convert_arg(value, output_dir=None) -> Argument:
     """
     Converts an argument (which could be a Tensor, list, int, float, etc.)
     into an Argument protobuf.
@@ -125,11 +135,38 @@ def convert_arg(value) -> Argument:
 
     if isinstance(value, torch.fx.Node):
         if isinstance(value.value, torch.Tensor):
-            set_tensor_field(arg.tensor, value)
+            set_tensor_field(arg.tensor, value, output_dir)
         elif isinstance(value.value, (tuple, list)):
+            for i, _t in enumerate(value.value):
+                arg.tensor_list.tensors.append(Tensor(
+                    node=f"{value.name}_{i}",
+                ))
+    # elif isinstance(value, (list, tuple)):
+    #     if all(isinstance(x, torch.fx.Node) for x in value):
+    #         arg.tensor_list.tensors.extend([
+    #             convert_arg(x, output_dir).tensor for x in value
+    #         ])
+    #     elif all(isinstance(x, int) for x in value):
+    #         arg.int_list.values.extend(value)
+    #     else:
+    #         raise TypeError(f"Unsupported list value: {value}")
+    elif isinstance(value, (list, tuple)):
+        if all(isinstance(x, torch.fx.Node) for x in value):
             arg.tensor_list.tensors.extend([
-                Tensor(node=f"{value.name}_{i}") for i in range(len(value.value))
+                convert_arg(x, output_dir).tensor for x in value
             ])
+        # If they are all *exactly* integers (e.g. 2.0, 4.0, etc.), treat them as ints:
+        elif all(isinstance(x, (int, float)) for x in value):
+            # check if they are all integral floats
+            if all(float(x).is_integer() for x in value):
+                int_list = [int(x) for x in value]
+                arg.int_list.values.extend(int_list)
+            else:
+                # If you want to handle arbitrary floats in a list,
+                # you need to define a FloatList in your proto or do something else.
+                raise TypeError(f"Unsupported float list value: {value}")
+        else:
+            raise TypeError(f"Unsupported list value: {value}")
     elif isinstance(value, int):
         arg.int_value = value
     elif isinstance(value, float):
@@ -138,24 +175,11 @@ def convert_arg(value) -> Argument:
         arg.bool_value = value
     elif isinstance(value, str):
         arg.str_value = value
-    elif isinstance(value, (
-        torch.dtype, torch.layout, torch.device, torch.memory_format
-    )):
-        arg.str_value = str(value).split(".")[-1]
-    elif isinstance(value, (list, tuple)):
-        if all(isinstance(x, torch.fx.Node) or x is None for x in value):
-            arg.tensor_list.tensors.extend([
-                convert_arg(x).tensor if x is not None else Tensor(is_none=True)
-                for x in value
-            ])
-        elif all(isinstance(x, int) for x in value):
-            arg.int_list.values.extend(value)
-        elif all(isinstance(x, bool) for x in value):
-            arg.bool_list.values.extend(value)
-        elif all(isinstance(x, (int, float, bool)) for x in value):
-            arg.scalar_list.values.extend(value)
-        else:
-            raise TypeError(f"Unsupported list value: {value}")
+    elif isinstance(value, torch.device):
+        # e.g. store "cpu" or "cuda:0" as a string
+        arg.str_value = str(value)
+    elif isinstance(value, torch.dtype):
+        arg.str_value = str(value).split(".")[1]
     else:
         raise TypeError(f"Unsupported arg type: {type(value)}")
 
@@ -191,12 +215,12 @@ def map_node(node: torch.fx.Node, output_dir=None) -> OpOverload:
 
     # Convert positional arguments
     for arg in args:
-        op_overload.args.append(convert_arg(arg))
+        op_overload.args.append(convert_arg(arg, output_dir))
 
     # Convert keyword arguments
     for key, value in kwargs.items():
         if "code" not in key and value is not None:
-            op_overload.kwargs[key].CopyFrom(convert_arg(value))
+            op_overload.kwargs[key].CopyFrom(convert_arg(value, output_dir))
 
     return op_overload
 
@@ -349,7 +373,6 @@ def _is_nop(node: Node) -> bool:
     return node.target in [
         torch.ops.aten.clone.default,
         torch.ops.aten.contiguous.default,
-        torch.ops.aten.copy_.default,
         torch.ops.aten.dropout.default,
         torch.ops.aten.flatten.using_ints,
         torch.ops.aten.reshape.default,
