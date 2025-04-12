@@ -630,6 +630,36 @@ if __name__ == "__main__":
             example_args,
             patterns=vector_stages
         )
+        compile(gm, example_args, **compile_args)
+    elif args.model == "maxpooltest":
+        class MaxPoolModel(torch.nn.Module):
+            def __init__(self):
+                super(MaxPoolModel, self).__init__()
+                self.pool = torch.nn.MaxPool2d(kernel_size=2)
+
+            def forward(self, x):
+                return self.pool(x)
+
+        # Example usage
+        model = MaxPoolModel()
+
+        if args.bf16:
+            model.bfloat16()
+        torch_dtype = torch.bfloat16 if args.bf16 else torch.float32
+
+        example_args = (torch.randn(1, 3, 100, 100, dtype=torch_dtype),)
+
+        gm = prepare_pt2e(model, quantizer, example_args)
+
+        convert_pt2e(gm)
+
+        orig_output, new_output = transform(
+            gm,
+            example_args,
+            patterns=vector_stages
+        )
+        compile(gm, example_args, **compile_args)
+
     else:
         raise ValueError(f"Model {args.model} not supported")
 
